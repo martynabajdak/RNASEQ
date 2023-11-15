@@ -1,0 +1,411 @@
+---
+title: "MA5111 Assignment"
+name: "Martyna Bajdak"
+number: "20364961"
+github: "https://github.com/martynabajdak"
+---
+
+```{r}
+library(dplyr)
+library(biomaRt)
+library(tximport)
+library(rhdf5)
+library(gplots)
+library(org.Hs.eg.db)
+library(DESeq2)
+library(DT)
+library(apeglm)
+library(RColorBrewer)
+library(IHW)
+library(PCAtools)
+library(pheatmap)
+library(clusterProfiler)
+library(EnhancedVolcano)
+library(ComplexHeatmap)
+library(circlize)
+library(fgsea)
+library(tidyverse)
+library(ggpubr)
+```
+```{r}
+quant_dir <- "/home/rstudio"
+list.files(quant_dir)
+```
+```{r}
+samples <- read.csv("mbsamples.csv", header=T, stringsAsFactors = T)
+samples
+```
+
+File containing the experimental metadata of the tumour vs control.
+
+```{r}
+samples$replicate <- factor(samples$replicate)
+
+factor_cols <- sapply(samples, is.factor)
+factor_cols
+```
+
+```{r}
+files <- file.path(quant_dir, rownames(samples), "abundance.tsv")
+names(files) <- paste0(rownames(samples))
+files
+```
+
+File paths for 'abundance.tsv' files associated with each sample in the 'samples' dataframe.
+
+```{r}
+mart <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+tx2gene <- getBM(attributes = c("ensembl_transcript_id_version", "hgnc_symbol"), mart = mart, useCache = FALSE)
+head(tx2gene)
+```
+
+Conversion of ENSEMBL transcript IDs into gene symbols.
+
+```{r}
+txi <- tximport(files, type = "kallisto", tx2gene = tx2gene)
+head(txi$abundance)
+```
+
+
+```{r}
+dds <- DESeqDataSetFromTximport(txi, colData = samples, design = ~ replicate + condition )
+```
+```{r}
+dds$condition <- relevel(dds$condition, ref = "control")
+dds <- DESeq(dds)
+resultsNames(dds)
+```
+
+Here, the reference level for the 'condition' factor is adjusted, conducting differential expression analysis using DESeq, which then obtained the names of the result tables from the analysis.
+
+```{r}
+counts <- counts(dds, normalized=TRUE)
+log2_counts <- assay(normTransform(dds))
+rld_counts <- assay(rlog(dds))
+
+library(vsn)
+library(hexbin)
+
+log2_plt <- meanSdPlot(log2_counts, ranks=FALSE, plot=FALSE)
+log2_plt$gg + ggtitle("Log2 + PC Transformation") + xlim(0,20)
+```
+
+This graph shows the performance of transformations on gene expression data, creating a mean-sd plot. The transformations applied, log2 and regularized log transformations, are common preprocessing steps in RNA-seq analysis. You can see the mean is highest at about 1 with standard deviation of about 0.5, producing a right skewed plot.
+
+```{r}
+rld_plt <- meanSdPlot(rld_counts, ranks=FALSE, plot=FALSE)
+rld_plt$gg + ggtitle("Rlog Transformation") + xlim(0,20)
+```
+
+This mean-sd plot is created for gene expression data that has undergone a regularized log transformation (rlog). These plots are used in the analysis of gene expression data to visualize the relationship between the mean and standard deviation of expression levels. This graph has the average mean of about 9 with a sd of about 0.1, creating a normal distribution like plot with majority of the data in the center.
+
+```{r}
+sampleDists <- dist(t(rld_counts))
+
+sampleDistMatrix <- as.matrix(sampleDists)
+
+colnames(sampleDistMatrix) <- NULL
+
+ann <- data.frame(Condition = samples$condition)
+
+col <- c("blue", "forestgreen")
+names(col) <- c("tumour", "control")
+ann_col <- list(Condition = col)
+
+rownames(ann) <- rownames(sampleDistMatrix)
+
+pheatmap(mat=sampleDistMatrix,
+        
+         clustering_distance_rows=sampleDists,
+         
+         clustering_distance_cols=sampleDists,
+          
+         annotation_col = ann,
+         
+         annotation_colors = ann_col,
+         
+         col=hcl.colors(100,"GnBu",rev=T))
+```
+
+This heatmap provides a visual representation of the similiarities and differences among samples, offering an overview of their relationships,with blue being tumour and green being the control. It visually represents the distance between samples with annotation bars indicating the conditions and associated colours. Each row is represneted by a gene and each column represents a sample condition. The colours and intensity of the boxes shows the changes of gene expression.
+
+```{r}
+p <- pca(rld_counts, metadata = samples)
+
+biplot(p,
+       colby = 'condition',
+       colkey = c('tumour'='royalblue', 'control'='forestgreen'),
+       hline = 0,
+       vline = 0,
+       legendPosition = 'right',
+       legendLabSize = 12,
+       legendIconSize = 8.0,
+       title = 'PCA bi-plot',
+       subtitle = 'PC1 versus PC2')
+```
+
+The PCA illustrates the variance attributed to samples in each principal component. PC1 & PC2 account for the majority of the dataset's variability. PC2 has 28.78% variation and PC1 has 44.11% variation. This PCA plot shots the simulated data with two treatment groups, control and tumour, and 3 biological replicates each. The initial principal component accounted for the variability observed in the baseline samples across the groups. The control has a much higher PC2 score whereas the tumour has a lower PC2 score.The two variables seem to be highly correlated as they point in similar directions in PC1. The samples are not close together meaning they will produce many DE genes as those that are very close together.
+
+```{r}
+tumour_v_ctrl <- results(dds, filterFun=ihw, alpha=0.05, c("condition", "tumour", "control"))
+res1 <- lfcShrink(dds=dds, res=tumour_v_ctrl, coef=4, type="apeglm")
+summary(res1)
+```
+
+This code conducted differential expression analysis between tumour and control conditions, applying multiple testing correction, and then performing log-fold change shrinkage on the obtained results using the DESeq2. 
+Out of the total 21,474 genes with a nonzero total read count, the analysis focuses on these genes. The p-value is less than 0.05, inidicating statistical significance after correcting for multiple testing. There are 269 genes with a log-fold change (LFC) greater than 0, suggesting upregulation in the specified experimental condition.There are 199 genes with a log-fold change less than 0, indicating downregulation in the specified experimental condition. No outliers are detected based on the criteria specified.
+
+```{r}
+get_upregulated <- function(df){
+    key <- intersect(rownames(df)[which(df$log2FoldChange>=1)], rownames(df)[which(df$pvalue<=0.05)])
+  results <- as.data.frame((df)[which(rownames(df) %in% key),])
+    return(results)
+}
+  
+```
+
+```{r}
+get_downregulated <- function(df){
+    key <- intersect(rownames(df)[which(df$log2FoldChange<=-1)], rownames(df)[which(df$pvalue<=0.05)])
+    results <- as.data.frame((df)[which(rownames(df) %in% key),])
+    return(results)
+}
+```
+
+```{r}
+annotate_de_genes <- function(df){
+
+    df$hgnc_symbol <- rownames(df)
+    mart <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+    info <- getBM(attributes=c("hgnc_symbol",
+                               "ensembl_gene_id_version",
+                               "chromosome_name",
+                               "start_position",
+                               "end_position",
+                               "strand",
+                               "entrezgene_description"),
+                  filters = c("hgnc_symbol"),
+                  values = df$hgnc_symbol,
+                  mart = mart,
+                  useCache=FALSE)
+
+    tmp <- merge(df, info, by="hgnc_symbol")
+    tmp$strand <- gsub("-1", "-", tmp$strand)
+    tmp$strand <- gsub("1", "+", tmp$strand)
+    tmp$hgnc_symbol <- make.names(tmp$hgnc_symbol, unique = T)
+    tmp <- tmp[!grepl("CHR", tmp$chromosome_name),]
+
+    output_col <- c("Gene", "Ensembl ID", "Chromosome", "Start", "Stop", "Strand", "Description", "Log2FC", "P-value", "Adj P-value")
+    tmp <- subset(tmp, select=c(hgnc_symbol, ensembl_gene_id_version, chromosome_name, start_position, end_position, strand, entrezgene_description, log2FoldChange, pvalue, padj))
+    colnames(tmp) <- output_col
+
+    if(min(tmp$Log2FC) > 0){
+        tmp <- tmp[order(-tmp$Log2FC),]
+    }else{
+        tmp <- tmp[order(tmp$Log2FC),]
+    }
+
+    return(tmp)
+
+}
+```
+
+```{r}
+de_up <- get_upregulated(as.data.frame(res1))
+de_down <- get_downregulated(as.data.frame(res1))
+upregulated_genes <- annotate_de_genes(de_up)
+downregulated_genes <- annotate_de_genes(de_down)
+
+head(upregulated_genes)
+```
+
+This table gives the gene, ensembl ID, chromosome number, start and stop strand, description, Log2FC, and P-value of the genes.
+
+```{r}
+res1 <- na.omit(res1)
+
+min_width <- min(res1$log2FoldChange)
+max_width <- max(res1$log2FoldChange)
+max_height <- -log10(min(res1[res1$pvalue>0, 5]))
+
+up <- subset(res1, res1$log2FoldChange > 1 & res1$pvalue <= 0.05)
+up <- up[order(-up$log2FoldChange),]
+up_list <- head(rownames(up), n=10L)
+
+down <- subset(res1, res1$log2FoldChange < -1 & res1$pvalue <= 0.05)
+down <- down[order(down$log2FoldChange),]
+down_list <- head(rownames(down), n=10L)
+
+plot_top_20 <- c(up_list, down_list)
+
+EnhancedVolcano(res1,
+                lab=rownames(res1),
+                x="log2FoldChange",
+                y="pvalue",
+                selectLab=plot_top_20,
+                drawConnectors=TRUE,
+                legendPosition = "none",
+                FCcutoff=1.0,
+                pCutoff=0.05,
+                title="Volcano Plot",
+                subtitle="Tumour vs. Control",
+                caption = paste0('Total Genes = ', nrow(res1)),
+                xlim=c(min_width, max_width),
+                ylim=c(0, max_height))
+```
+
+The Y axis represents the level of statistical significance with the p value. The most statistically significant genes are towards the top, as they have the lowest p-values. This can be seen with CXCL5 and ID3. Majority of the genes are not very significant. 
+The X axis shows the fold change, which is the ratio between the gene expression of tumour and control. There is mostly upregulated genes with a  positive fold change such as SKIL and COL9A3. The downregulated genes have a negative fold such as ACSS2 and HDAS9.
+Majority is in the fold change 0, meaning the expression does not change between tumour and control. 
+
+```{r}
+res1 <- na.omit(tumour_v_ctrl)
+
+min_width <- min(res1$log2FoldChange)
+max_width <- max(res1$log2FoldChange)
+max_height <- -log10(min(res1[res1$pvalue>0, 5]))
+
+up <- subset(res1, res1$log2FoldChange > 1 & res1$pvalue <= 0.05)
+up <- up[order(-up$log2FoldChange),]
+up_list <- head(rownames(up), n=10L)
+
+down <- subset(res1, res1$log2FoldChange < -1 & res1$pvalue <= 0.05)
+down <- down[order(down$log2FoldChange),]
+down_list <- head(rownames(down), n=10L)
+
+plot_top_20 <- c(up_list, down_list)
+EnhancedVolcano(res1,
+                      lab=rownames(res1),
+                    x="log2FoldChange",
+                    y="pvalue",
+                    selectLab=plot_top_20,
+                    drawConnectors=TRUE,
+                    FCcutoff=1.0,
+                    pCutoff=0.05,
+                    title="Volcano Plot",
+                    subtitle="Tumour vs. Control",
+                    legendLabSize=8,
+                    caption = paste0('Total Genes = ', nrow(res1)))
+```
+
+This enahnced volcano plot visually represents the differential expression results, highlighting the most significantly upregulated and downregulated genes in context of tumour vs control conditions. 
+You can see that there is a few significant genes with the p-value and log2FC, such as ID3. Most are still quite not as significant with majority in the fold change 0. 
+
+```{r}
+subset <- rld_counts[, 1:6]
+
+up <- rownames(de_up)
+down <- rownames(de_down)
+
+key <- c(up, down)
+subset <- subset[which(rownames(subset) %in% key),]
+
+mat <- as.matrix(scale(t(subset), center = T))
+
+ann <- data.frame(Condition = c(rep("Control", 3), rep("Tumour", 3)))
+rownames(ann) <- rownames(mat)
+col <- c("blue", "forestgreen")
+names(col) <- c("Control", "Tumour")
+ann_col <- list(Condition = col)
+
+pheatmap(t(mat), 
+         show_rownames = FALSE,
+         annotation_col = ann,
+         annotation_colors = ann_col,
+         color = hcl.colors(100, "PRGn",rev=F))
+```
+
+This heatmap provides the differentially expressed genes in the experimental contrast of interest. It visually represents the distance between samples with annotation bars indicating the conditions and associated colours. Each row is represneted by a gene and each column represents a sample condition. The colours and intensity of the boxes shows the changes of gene expression. The brighter colours represent larger values, up to 2 and -2, while faded colours represent smaller values, 0. It indicates the relative expression levels of genes.
+
+
+```{r}
+res <- as.data.frame(res1) 
+res$hgnc_symbol <- rownames(res)
+
+# compute summary stat
+fgsea_rank <- res %>%
+              dplyr::select(hgnc_symbol, log2FoldChange) %>%
+              na.omit() %>%
+              distinct() %>%
+              group_by(hgnc_symbol) %>%
+              summarize(stat=mean(log2FoldChange))
+
+fgsea_rank
+```
+
+A ranked gene list from tumour vs control study which then was converted to a named list.
+
+```{r}
+rank <- deframe(fgsea_rank)
+head(rank, 20)
+```
+```{r}
+pathway <- gmtPathways("/home/rstudio/c6.all.v2023.2.Hs.symbols.gmt")
+head(pathway, 1)
+```
+
+GMT file.
+
+```{r}
+fgsea <- fgsea(pathways=pathway, stats=rank, nperm=1000)
+
+fgseaResTidy <- fgsea %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+
+fgseaResTidy %>%
+  dplyr::select(-leadingEdge, -ES, -nMoreExtreme) %>%
+  arrange(padj) %>%
+  DT::datatable()
+```
+
+This code performs gene set enrichment analysis which transforms the results into a tidy format, and then creates an interactive table for visualizing and exploring the enriched gene sets. This table includes infromation such as gene set names, normalized enrichment scores (NES), and other relevent details.
+
+```{r}
+filtered_pathway <- subset(fgsea, NES > 1.2)
+filtered_pathway
+```
+
+These are instances of enriched pathways in our tumour samples as well as pathways enriched in the control samples with a NES > 1.2.
+
+```{r}
+filt_up <- as.vector(filtered_pathway$pathway)
+
+for (i in filt_up){
+    plt <- plotEnrichment(pathway = pathway[[i]],
+    gseaParam = 1, ticksSize = 0.5, stats= rank) +
+    labs(title=i) + theme(plot.title = element_text(hjust = 0.5, face="bold"))
+    print(plt)
+}
+```
+
+Here, you see the enrichment score vs the rank of the pathways. This shows the 8 gene sets with a NES score > 1.2. The peak point of the green line is the enrichment score. For example, for HINATA_NFKB_IMMU_INF the enrichment score peak is at about 0.78.
+
+```{r}
+filtered_pathway <- subset(fgsea, NES < -1.3)
+filtered_pathway
+```
+
+```{r}
+filt_down <- as.vector(filtered_pathway$pathway)
+
+for (i in filt_down){
+    plt <- plotEnrichment(pathway = pathway[[i]],
+    gseaParam = 1, ticksSize = 0.5, stats= rank) +
+    labs(title=i) + theme(plot.title = element_text(hjust = 0.5, face="bold"))
+    print(plt)
+}
+```
+
+This is another enrichment plot with with an NES score of -1.3, with 3 gene sets. The peak point of the green line is the enrichment score, but this time it is in the negative. For example, for CSR_LATE_UP.V1_DN the enrichment score peak is at about -0.4. GSEA is saying that enrichment of these genes appears anticorrelated with this high expression.
+
+
+#At the end of the report, you should include a few short paragraphs (~500 words) linking some of the top DEGs to known cancer biology#
+Connecting differentially expressed genes (DEGs) to established cancer biology offers important new understandings into the molecular processes behind the onset and spread of cancer. Top DEGs include ID3, ADAMTS12, and ID1, which have been identified as top DEGs in certain cancer types.
+Inhibitor of DNA Binding 3 (ID3) is a transcription factor (TF) that belongs to the helix-loop-helix (HLH) family and is well-known for its roles in controlling cell cycle progression and cellular differentiation. ID3 has been linked to the promotion of tumour growth and metastasis in cancer. ID3 expression has been found to be elevated in a number of cancer types, including pancreatic, lung, and breast cancers. ID3 may maintain the properties of cancer stem cells by inhibiting differentiation and facilitating the growth of tumours. It is a promising target for therapeutic therapies meant to interfere with processes that initiate tumour growth because of its participation in cancer stemness.
+Inhibitor of DNA Binding 1 (ID1), functions similarly to ID3. Similarly, to ID3, ID1 has been linked to the development of cancer and is involved in the control of cellular differentiation. ID1 is associated with aggressive behaviour in malignancies and is frequently overexpressed in them. For instance, poor prognosis and treatment resistance are associated with elevated ID1 expression in breast cancer. It is a possible target for therapy due to its functions in apoptosis avoidance, angiogenesis, and cell proliferation. 
+A member of the ADAMTS family of metalloproteinases, A Disintegrin and Metalloproteinase with Thrombospondin Motifs 12 (ADAMTS12) is well-known for its role in extracellular matric (ECM) remodelling. A crucial factor in the development of cancer is ECM modification, which affects cell invasion, migration, and metastasis. ADAMTS12 has been found to be a DEG in a number of malignancies, including stomach tumours. Its dysregulation affects the behaviour of cancer cells by causing alterations in the tumour microenvironment. It may modulate elements of the ECM to prevent tumour growth and metastasis.
+There are other DEG’s linked with cancer such as TP53. TP53, one of the genes most common mutated genes in cancer, is essential for controlling the cell cycle and inducing apoptosis.  TP53 is the genetic locus responsible for encoding the p53 tumour suppressor protein, often recognized as the “Guardian of the Genome”. The p53 pathway constitutes a intricate cellular stress response network characterized by various inputs and diverse downstream inputs that are pertinent to its function as a tumour suppressor pathway. Tumorigenesis is aided by TP53 mutations, which are linked to unchecked cell proliferation and resistance to cell death. TP53 mutations are common in many malignancies, including lung cancer, and are frequently associated with a more aggressive phenotype. 
+These genes contribute to cancer progression by influencing key cellular processes. Understanding their roles in cancer provides valuable insights for the development of targeted therapies that aim to disrupt these processes and improve outcomes for cancer patients.
+
+
